@@ -1,3 +1,12 @@
+v7.3.0 (UNRELEASED)
+===================
+
+- Deduplicate concurrent ``@cached`` calls with identical cache keys
+  when used with ``lock``: only the first thread computes the value,
+  and waiting threads receive the same result or re-raise the same
+  exception.  Waiting threads are counted as cache hits.
+
+
 v7.2.0 (2026-09-16)
 ===================
 

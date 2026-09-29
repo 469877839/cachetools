@@ -3,12 +3,30 @@
 __all__ = ()
 
 import functools
+import threading
 import warnings
 
 # At least for now, the implementation prefers clarity and performance
 # over ease of maintenance, thus providing separate wrappers for
 # all valid combinations of decorator parameters lock, condition and
 # info.
+
+
+class _Pending:
+    """Record of an in-flight function call for a single cache key.
+
+    Used by the locked wrappers to make concurrent calls for the same
+    key compute the value only once: the first thread to arrive stores
+    a record in the pending table and calls the wrapped function, while
+    subsequent threads wait on the record's event for its result.
+    """
+
+    __slots__ = ("event", "result", "exc")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+        self.exc = None
 
 
 def _condition_info(func, cache, key, lock, cond, info):
@@ -57,6 +75,8 @@ def _condition_info(func, cache, key, lock, cond, info):
 
 def _locked_info(func, cache, key, lock, info):
     hits = misses = 0
+    pending = {}
+    pending_lock = threading.Lock()
 
     def wrapper(*args, **kwargs):
         nonlocal hits, misses
@@ -67,16 +87,51 @@ def _locked_info(func, cache, key, lock, info):
                 hits += 1
                 return result
             except KeyError:
+                pass  # key not found
+        # The caller-provided lock is never held while calling func()
+        # or waiting for a pending call, so distinct keys are computed
+        # concurrently and non-reentrant locks are safe to use.
+        with pending_lock:
+            record = pending.get(k)
+            if record is None:
+                record = pending[k] = _Pending()
                 misses += 1
-        v = func(*args, **kwargs)
-        with lock:
-            try:
-                # In case of a race condition, i.e. if another thread
-                # stored a value for this key while we were calling
-                # func(), prefer the cached value.
-                return cache.setdefault(k, v)
-            except ValueError:
-                return v  # value too large
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            # Another thread is already computing this key; wait for
+            # its result and count it as a hit, so that misses always
+            # equals the number of actual func() calls.
+            record.event.wait()
+            if record.exc is not None:
+                raise record.exc
+            with pending_lock:
+                hits += 1
+            return record.result
+        try:
+            v = func(*args, **kwargs)
+            with lock:
+                try:
+                    # In case of a race condition, i.e. if another thread
+                    # stored a value for this key while we were calling
+                    # func(), prefer the cached value.
+                    v = cache.setdefault(k, v)
+                except ValueError:
+                    pass  # value too large
+            record.result = v
+            return v
+        except BaseException as e:
+            # Waiters must receive the exact same exception.
+            record.exc = e
+            raise
+        finally:
+            # Remove the record before notifying waiters, so the
+            # pending table is cleaned up even if this thread gets
+            # interrupted while notifying.
+            with pending_lock:
+                pending.pop(k, None)
+                record.event.set()
 
     def cache_clear():
         nonlocal hits, misses
@@ -176,6 +231,9 @@ def _condition(func, cache, key, lock, cond):
 
 
 def _locked(func, cache, key, lock):
+    pending = {}
+    pending_lock = threading.Lock()
+
     def wrapper(*args, **kwargs):
         k = key(*args, **kwargs)
         with lock:
@@ -183,15 +241,46 @@ def _locked(func, cache, key, lock):
                 return cache[k]
             except KeyError:
                 pass  # key not found
-        v = func(*args, **kwargs)
-        with lock:
-            try:
-                # In case of a race condition, i.e. if another thread
-                # stored a value for this key while we were calling
-                # func(), prefer the cached value.
-                return cache.setdefault(k, v)
-            except ValueError:
-                return v  # value too large
+        # The caller-provided lock is never held while calling func()
+        # or waiting for a pending call, so distinct keys are computed
+        # concurrently and non-reentrant locks are safe to use.
+        with pending_lock:
+            record = pending.get(k)
+            if record is None:
+                record = pending[k] = _Pending()
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            # Another thread is already computing this key; wait for
+            # its result.
+            record.event.wait()
+            if record.exc is not None:
+                raise record.exc
+            return record.result
+        try:
+            v = func(*args, **kwargs)
+            with lock:
+                try:
+                    # In case of a race condition, i.e. if another thread
+                    # stored a value for this key while we were calling
+                    # func(), prefer the cached value.
+                    v = cache.setdefault(k, v)
+                except ValueError:
+                    pass  # value too large
+            record.result = v
+            return v
+        except BaseException as e:
+            # Waiters must receive the exact same exception.
+            record.exc = e
+            raise
+        finally:
+            # Remove the record before notifying waiters, so the
+            # pending table is cleaned up even if this thread gets
+            # interrupted while notifying.
+            with pending_lock:
+                pending.pop(k, None)
+                record.event.set()
 
     def cache_clear():
         with lock:

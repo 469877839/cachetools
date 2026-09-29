@@ -328,6 +328,12 @@ often called with the same arguments:
       outside the `with` statement to allow concurrent execution, and
       therefore must be `thread-safe`_ by itself.
 
+      Concurrent calls with identical cache keys are deduplicated:
+      the first calling thread executes the wrapped function, and
+      threads arriving later for the same key wait for it to finish
+      and receive the same result, or re-raise the same exception.
+      Calls with distinct cache keys still execute concurrently.
+
    If `condition` is not :const:`None`, it must specify a `condition
    variable`_, i.e. an object providing :func:`wait()`,
    :func:`wait_for()`, :func:`notify()` and :func:`notify_all()`
@@ -343,10 +349,10 @@ often called with the same arguments:
    .. note::
 
       Although providing a `lock` alone is generally sufficient to
-      make :func:`cached` `thread-safe`_, it may still be subject to
-      `cache stampede`_ issues under high load, depending on your
-      actual use case.  Providing a `condition` variable will mitigate
-      these situations, but will inflict some performance penalty.
+      make :func:`cached` `thread-safe`_ and prevent `cache stampede`_
+      issues, a `condition` variable may be used instead to wait for
+      pending calls via the `condition` itself, but will inflict some
+      performance penalty.
 
    If no separate `lock` parameter is provided, `condition` must also
    implement the `context manager`_ protocol, and will also be used to
