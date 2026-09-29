@@ -93,9 +93,9 @@ class ThreadingTest(unittest.TestCase):
             t.join(timeout=self.TIMEOUT)
             self.assertFalse(t.is_alive())
 
-        # Without condition/stampede prevention, func is called by multiple
-        # threads, but all return the same cached value (42).
-        self.assertGreaterEqual(count, 1)
+        # Concurrent calls with identical keys are deduplicated: func is
+        # called exactly once, and all threads return the same value (42).
+        self.assertEqual(count, 1)
 
         info = locked_func.cache_info()
         self.assertEqual(info.hits + info.misses, self.NTHREADS)
@@ -120,3 +120,120 @@ class ThreadingTest(unittest.TestCase):
         info = self.locked_method.cache_info()
         self.assertEqual(info.hits + info.misses, self.NTHREADS)
         self.assertGreaterEqual(info.misses, 1)
+
+
+class LockedSingleFlightTest(unittest.TestCase):
+    NTHREADS = 5
+
+    TIMEOUT = 10
+
+    def test_same_key_computed_once(self):
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        @cached(cache=LRUCache(1), lock=threading.Lock(), info=True)
+        def func():
+            calls.append(1)
+            entered.set()
+            release.wait(timeout=self.TIMEOUT)
+            return object()
+
+        results = []
+
+        def call():
+            results.append(func())
+
+        threads = [threading.Thread(target=call) for _ in range(self.NTHREADS)]
+        for t in threads:
+            t.start()
+        self.assertTrue(entered.wait(timeout=self.TIMEOUT))
+        # give the remaining threads a chance to pile up on the pending call
+        time.sleep(0.5)
+        release.set()
+        for t in threads:
+            t.join(timeout=self.TIMEOUT)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(results), self.NTHREADS)
+        # all callers receive the identical object
+        self.assertTrue(all(r is results[0] for r in results))
+
+        info = func.cache_info()
+        self.assertEqual(info.hits + info.misses, self.NTHREADS)
+
+    def test_different_keys_overlap(self):
+        entered = {1: threading.Event(), 2: threading.Event()}
+        errors = []
+
+        @cached(cache=LRUCache(2), lock=threading.Lock())
+        def func(x):
+            entered[x].set()
+            # wait for the other key's call to start: unless computations
+            # with different keys overlap, this deadlocks and times out
+            other = 2 if x == 1 else 1
+            if not entered[other].wait(timeout=self.TIMEOUT):
+                errors.append(RuntimeError("no overlap"))
+            return x
+
+        results = []
+
+        def call(x):
+            try:
+                results.append(func(x))
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=call, args=(i,)) for i in (1, 2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=2 * self.TIMEOUT)
+            self.assertFalse(t.is_alive())
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(results), [1, 2])
+
+    def test_exception_shared_with_waiters(self):
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        @cached(cache=LRUCache(1), lock=threading.Lock())
+        def func():
+            calls.append(1)
+            entered.set()
+            release.wait(timeout=self.TIMEOUT)
+            raise ValueError("test error")
+
+        errors = []
+
+        def call():
+            try:
+                func()
+            except ValueError as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=call) for _ in range(self.NTHREADS)]
+        for t in threads:
+            t.start()
+        self.assertTrue(entered.wait(timeout=self.TIMEOUT))
+        # give the remaining threads a chance to pile up on the pending call
+        time.sleep(0.5)
+        release.set()
+        for t in threads:
+            t.join(timeout=self.TIMEOUT)
+            self.assertFalse(t.is_alive())
+
+        # the wrapped function raised only once...
+        self.assertEqual(len(calls), 1)
+        # ...but every caller received the very same exception
+        self.assertEqual(len(errors), self.NTHREADS)
+        self.assertTrue(all(e is errors[0] for e in errors))
+        self.assertEqual(str(errors[0]), "test error")
+
+        # the failed key must not be stuck: the next call recomputes
+        with self.assertRaises(ValueError):
+            func()
+        self.assertEqual(len(calls), 2)

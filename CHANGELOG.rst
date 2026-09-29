@@ -1,3 +1,13 @@
+v7.3.0 (unreleased)
+===================
+
+- Deduplicate concurrent ``@cached`` calls with identical cache keys
+  when only a ``lock`` is provided: the first call computes the
+  result while subsequent callers wait for it without holding
+  ``lock``, and then return the same value or raise the same
+  exception.
+
+
 v7.2.0 (2026-09-16)
 ===================
 

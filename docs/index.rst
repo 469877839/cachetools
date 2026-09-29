@@ -326,7 +326,11 @@ often called with the same arguments:
       The `lock` context manager is used only to guard access to the
       cache object.  The underlying wrapped function will be called
       outside the `with` statement to allow concurrent execution, and
-      therefore must be `thread-safe`_ by itself.
+      therefore must be `thread-safe`_ by itself.  Concurrent calls
+      with identical cache keys are deduplicated: the first call
+      executes the wrapped function while subsequent callers wait for
+      it without holding `lock`, and then return the same value or
+      raise the same exception.
 
    If `condition` is not :const:`None`, it must specify a `condition
    variable`_, i.e. an object providing :func:`wait()`,
@@ -342,11 +346,13 @@ often called with the same arguments:
 
    .. note::
 
-      Although providing a `lock` alone is generally sufficient to
-      make :func:`cached` `thread-safe`_, it may still be subject to
-      `cache stampede`_ issues under high load, depending on your
-      actual use case.  Providing a `condition` variable will mitigate
-      these situations, but will inflict some performance penalty.
+      Providing a `lock` alone is sufficient to make :func:`cached`
+      `thread-safe`_, and prevents `cache stampede`_ issues for
+      concurrent calls with identical cache keys as described above.
+      Note, however, that callers waiting for a failed call will
+      re-raise its exception, while providing a `condition` variable
+      will make waiting callers retry the wrapped function after a
+      failure.
 
    If no separate `lock` parameter is provided, `condition` must also
    implement the `context manager`_ protocol, and will also be used to

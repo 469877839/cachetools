@@ -3,12 +3,24 @@
 __all__ = ()
 
 import functools
+import threading
 import warnings
 
 # At least for now, the implementation prefers clarity and performance
 # over ease of maintenance, thus providing separate wrappers for
 # all valid combinations of decorator parameters lock, condition and
 # info.
+
+
+class _Inflight:
+    """In-progress computation shared by concurrent callers of one key."""
+
+    __slots__ = ("event", "value", "error")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.value = None
+        self.error = None
 
 
 def _condition_info(func, cache, key, lock, cond, info):
@@ -57,6 +69,8 @@ def _condition_info(func, cache, key, lock, cond, info):
 
 def _locked_info(func, cache, key, lock, info):
     hits = misses = 0
+    inflight = {}
+    inflight_lock = threading.Lock()
 
     def wrapper(*args, **kwargs):
         nonlocal hits, misses
@@ -68,15 +82,41 @@ def _locked_info(func, cache, key, lock, info):
                 return result
             except KeyError:
                 misses += 1
-        v = func(*args, **kwargs)
-        with lock:
-            try:
-                # In case of a race condition, i.e. if another thread
-                # stored a value for this key while we were calling
-                # func(), prefer the cached value.
-                return cache.setdefault(k, v)
-            except ValueError:
-                return v  # value too large
+        with inflight_lock:
+            entry = inflight.get(k)
+            if entry is None:
+                entry = inflight[k] = _Inflight()
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            # Another thread is already computing this key.  Wait for
+            # its result without holding any lock, so concurrent calls
+            # with different keys are not serialized behind us.
+            entry.event.wait()
+            if entry.error is not None:
+                raise entry.error
+            return entry.value
+        try:
+            v = func(*args, **kwargs)
+            with lock:
+                try:
+                    # In case of a race condition, i.e. if another thread
+                    # stored a value for this key while we were calling
+                    # func(), prefer the cached value.
+                    v = cache.setdefault(k, v)
+                except ValueError:
+                    pass  # value too large
+            entry.value = v
+            return v
+        except BaseException as e:
+            # Share the exact exception with any waiting threads.
+            entry.error = e
+            raise
+        finally:
+            with inflight_lock:
+                inflight.pop(k, None)
+                entry.event.set()
 
     def cache_clear():
         nonlocal hits, misses
@@ -176,6 +216,9 @@ def _condition(func, cache, key, lock, cond):
 
 
 def _locked(func, cache, key, lock):
+    inflight = {}
+    inflight_lock = threading.Lock()
+
     def wrapper(*args, **kwargs):
         k = key(*args, **kwargs)
         with lock:
@@ -183,15 +226,41 @@ def _locked(func, cache, key, lock):
                 return cache[k]
             except KeyError:
                 pass  # key not found
-        v = func(*args, **kwargs)
-        with lock:
-            try:
-                # In case of a race condition, i.e. if another thread
-                # stored a value for this key while we were calling
-                # func(), prefer the cached value.
-                return cache.setdefault(k, v)
-            except ValueError:
-                return v  # value too large
+        with inflight_lock:
+            entry = inflight.get(k)
+            if entry is None:
+                entry = inflight[k] = _Inflight()
+                leader = True
+            else:
+                leader = False
+        if not leader:
+            # Another thread is already computing this key.  Wait for
+            # its result without holding any lock, so concurrent calls
+            # with different keys are not serialized behind us.
+            entry.event.wait()
+            if entry.error is not None:
+                raise entry.error
+            return entry.value
+        try:
+            v = func(*args, **kwargs)
+            with lock:
+                try:
+                    # In case of a race condition, i.e. if another thread
+                    # stored a value for this key while we were calling
+                    # func(), prefer the cached value.
+                    v = cache.setdefault(k, v)
+                except ValueError:
+                    pass  # value too large
+            entry.value = v
+            return v
+        except BaseException as e:
+            # Share the exact exception with any waiting threads.
+            entry.error = e
+            raise
+        finally:
+            with inflight_lock:
+                inflight.pop(k, None)
+                entry.event.set()
 
     def cache_clear():
         with lock:
